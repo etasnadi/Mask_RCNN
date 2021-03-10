@@ -1214,7 +1214,7 @@ def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
 #  Data Generator
 ############################################################
 
-def load_image_gt(dataset, config, image_id, augmentation=None):
+def load_image_gt(dataset, config, image_id, augmentation=None, augmentation_lib=None):
     """Load and return ground truth data for an image (image, mask, bounding boxes).
 
     augmentation: Optional. An imgaug (https://github.com/aleju/imgaug) augmentation.
@@ -1245,28 +1245,48 @@ def load_image_gt(dataset, config, image_id, augmentation=None):
     # Augmentation
     # This requires the imgaug lib (https://github.com/aleju/imgaug)
     if augmentation:
-        import imgaug
+        if augmentation_lib == 'imgaug' or augmentation_lib is None:
+            import imgaug
 
-        # Augmenters that are safe to apply to masks
-        # Some, such as Affine, have settings that make them unsafe, so always
-        # test your augmentation on masks
-        MASK_AUGMENTERS = ["Sequential", "SomeOf", "OneOf", "Sometimes",
-                           "Fliplr", "Flipud", "CropAndPad",
-                           "Affine", "PiecewiseAffine"]
+            # Augmenters that are safe to apply to masks
+            # Some, such as Affine, have settings that make them unsafe, so always
+            # test your augmentation on masks
+            MASK_AUGMENTERS = ["Sequential", "SomeOf", "OneOf", "Sometimes",
+                            "Fliplr", "Flipud", "CropAndPad",
+                            "Affine", "PiecewiseAffine"]
 
-        def hook(images, augmenter, parents, default):
-            """Determines which augmenters to apply to masks."""
-            return augmenter.__class__.__name__ in MASK_AUGMENTERS
+            def hook(images, augmenter, parents, default):
+                """Determines which augmenters to apply to masks."""
+                return augmenter.__class__.__name__ in MASK_AUGMENTERS
 
-        # Store shapes before augmentation to compare
-        image_shape = image.shape
-        mask_shape = mask.shape
-        # Make augmenters deterministic to apply similarly to images and masks
-        det = augmentation.to_deterministic()
-        image = det.augment_image(image)
-        # Change mask to np.uint8 because imgaug doesn't support np.bool
-        mask = det.augment_image(mask.astype(np.uint8),
-                                 hooks=imgaug.HooksImages(activator=hook))
+            # Store shapes before augmentation to compare
+            image_shape = image.shape
+            mask_shape = mask.shape
+            # Make augmenters deterministic to apply similarly to images and masks
+            det = augmentation.to_deterministic()
+            image = det.augment_image(image)
+            # Change mask to np.uint8 because imgaug doesn't support np.bool
+            mask = det.augment_image(mask.astype(np.uint8),
+                                    hooks=imgaug.HooksImages(activator=hook))
+
+        elif augmentation_lib == 'album':
+            import albumentations as A
+
+            def augment_with_albumentations(image, mask, transform):
+                masks = [mask[..., idx] for idx in range(mask.shape[-1])]
+                transformed = transform(image=image, masks=masks)
+                
+                image_aug = transformed['image']
+                mask_aug = transformed['masks']
+                
+                mask_aug = np.stack(mask_aug, -1)
+
+                return image_aug, mask_aug
+
+            image, mask = augment_with_albumentations(image, mask, augmentation)
+        else:
+            raise ValueError("Invalid augmentation library provided")
+
         # Verify that shapes didn't change
         assert image.shape == image_shape, "Augmentation shouldn't change image size"
         assert mask.shape == mask_shape, "Augmentation shouldn't change mask size"
@@ -1679,7 +1699,7 @@ class DataGenerator(KU.Sequence):
             and masks.
         """
 
-    def __init__(self, dataset, config, shuffle=True, augmentation=None,
+    def __init__(self, dataset, config, shuffle=True, augmentation=None, augmentation_lib='imgaug',
                  random_rois=0, detection_targets=False):
 
         self.image_ids = np.copy(dataset.image_ids)
@@ -1697,6 +1717,7 @@ class DataGenerator(KU.Sequence):
 
         self.shuffle = shuffle
         self.augmentation = augmentation
+        self.augmentation_lib = augmentation_lib
         self.random_rois = random_rois
         self.batch_size = self.config.BATCH_SIZE
         self.detection_targets = detection_targets
@@ -1718,7 +1739,7 @@ class DataGenerator(KU.Sequence):
             image_id = self.image_ids[image_index]
             image, image_meta, gt_class_ids, gt_boxes, gt_masks = \
                 load_image_gt(self.dataset, self.config, image_id,
-                              augmentation=self.augmentation)
+                              augmentation=self.augmentation, augmentation_lib=self.augmentation_lib)
 
             # Skip images that have no instances. This can happen in cases
             # where we train on a subset of classes and the image doesn't
@@ -2361,6 +2382,7 @@ class MaskRCNN(object):
         else:
             workers = multiprocessing.cpu_count()
 
+        use_multiprocessing = False
         self.keras_model.fit(
             train_generator,
             initial_epoch=self.epoch,
@@ -2371,7 +2393,7 @@ class MaskRCNN(object):
             validation_steps=self.config.VALIDATION_STEPS,
             max_queue_size=100,
             workers=workers,
-            use_multiprocessing=workers > 1,
+            use_multiprocessing=(workers > 1) and use_multiprocessing,
         )
         self.epoch = max(self.epoch, epochs)
 
